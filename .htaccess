@@ -1,0 +1,11 @@
+SetEnv APP_ENV dev
+SetEnv DB_HOST 127.0.0.1
+SetEnv DB_PORT 3306
+SetEnv DB_USER root
+SetEnv DB_PASS
+SetEnv DB_NAME sigudob_db
+SetEnv JWT_SECRET sigudob-local-secret-ubah-ini
+SetEnv CORS_ALLOWED_ORIGINS http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost,http://127.0.0.1
+
+Options -Indexes
+DirectoryIndex index.php

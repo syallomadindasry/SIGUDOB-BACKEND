@@ -1,0 +1,9 @@
+vendor/
+node_modules/
+storage/logs/*.log
+bootstrap/cache/*.php
+.env
+.env.local
+*.log
+.vscode/
+.idea/
