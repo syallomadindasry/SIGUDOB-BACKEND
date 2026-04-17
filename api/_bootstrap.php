@@ -13,7 +13,31 @@ ini_set('display_startup_errors', '0');
 ini_set('log_errors', '1');
 error_reporting(E_ALL);
 
-header('Content-Type: application/json; charset=utf-8');
+function apply_cors(array $allowedOrigins = []): void
+{
+    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+
+    if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
+        header("Access-Control-Allow-Origin: {$origin}");
+        header('Vary: Origin');
+        header('Access-Control-Allow-Credentials: true');
+    }
+
+    header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization');
+    header('Content-Type: application/json; charset=utf-8');
+
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'OPTIONS') {
+        http_response_code(204);
+        exit;
+    }
+}
+
+apply_cors([
+    'https://sistemgudangobat.netlify.app',
+    'http://localhost:3000',
+    'http://localhost:5173',
+]);
 
 function json_input(): array
 {

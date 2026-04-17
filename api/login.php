@@ -8,8 +8,24 @@ require_once __DIR__ . '/jwt.php';
 
 $config = require __DIR__ . '/../config.php';
 
-if (request_method() !== 'POST') {
-    respond(405, ['error' => 'Gunakan POST']);
+function handle_cors(array $allowedOrigins): void
+{
+    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+
+    if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
+        header("Access-Control-Allow-Origin: {$origin}");
+        header('Vary: Origin');
+        header('Access-Control-Allow-Credentials: true');
+    }
+
+    header('Access-Control-Allow-Methods: POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization');
+    header('Content-Type: application/json; charset=UTF-8');
+
+    if (request_method() === 'OPTIONS') {
+        http_response_code(204);
+        exit;
+    }
 }
 
 function normalize_login_key(string $value): string
@@ -132,92 +148,114 @@ function upgrade_hash_if_needed(int $userId, string $plain, string $stored): voi
     );
 }
 
-$input = request_input();
-$usernameInput = trim((string)($input['username'] ?? $input['nama'] ?? ''));
-$passwordInput = (string)($input['password'] ?? '');
+handle_cors([
+    'https://sistemgudangobat.netlify.app',
+    'http://127.0.0.1:5174',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+]);
 
-if ($usernameInput === '' || $passwordInput === '') {
-    respond(400, ['error' => 'Username dan password wajib diisi']);
+if (request_method() !== 'POST') {
+    respond(405, ['error' => 'Gunakan POST']);
 }
 
-$sql = "
-    SELECT
-        u.id_admin AS id,
-        u.nama AS username,
-        u.password AS pass_stored,
-        u.role,
-        u.id_gudang,
-        g.nama_gudang
-    FROM `user` u
-    INNER JOIN gudang g ON g.id_gudang = u.id_gudang
-";
+try {
+    $input = request_input();
+    $usernameInput = trim((string)($input['username'] ?? $input['nama'] ?? ''));
+    $passwordInput = (string)($input['password'] ?? '');
 
-$users = db_all($sql);
+    if ($usernameInput === '' || $passwordInput === '') {
+        respond(400, ['error' => 'Username dan password wajib diisi']);
+    }
 
-$inputKeys = array_values(array_unique(array_filter([
-    normalize_login_key($usernameInput),
-    shrink_login_key($usernameInput),
-])));
+    $sql = "
+        SELECT
+            u.id_admin AS id,
+            u.nama AS username,
+            u.password AS pass_stored,
+            u.role,
+            u.id_gudang,
+            g.nama_gudang
+        FROM `user` u
+        INNER JOIN gudang g ON g.id_gudang = u.id_gudang
+    ";
 
-$matched = null;
+    $users = db_all($sql);
 
-foreach ($users as $user) {
-    $aliases = build_login_aliases($user);
+    $inputKeys = array_values(array_unique(array_filter([
+        normalize_login_key($usernameInput),
+        shrink_login_key($usernameInput),
+    ])));
 
-    foreach ($inputKeys as $key) {
-        if (in_array($key, $aliases, true)) {
-            $matched = $user;
-            break 2;
+    $matched = null;
+
+    foreach ($users as $user) {
+        $aliases = build_login_aliases($user);
+
+        foreach ($inputKeys as $key) {
+            if (in_array($key, $aliases, true)) {
+                $matched = $user;
+                break 2;
+            }
         }
     }
-}
 
-if (!$matched) {
-    respond(401, ['error' => 'Username atau password salah']);
-}
+    if (!$matched) {
+        respond(401, ['error' => 'Username atau password salah']);
+    }
 
-$userId = (int)($matched['id'] ?? 0);
-$storedPassword = (string)($matched['pass_stored'] ?? '');
+    $userId = (int)($matched['id'] ?? 0);
+    $storedPassword = (string)($matched['pass_stored'] ?? '');
 
-if (!verify_password_value($passwordInput, $storedPassword)) {
-    respond(401, ['error' => 'Username atau password salah']);
-}
+    if (!verify_password_value($passwordInput, $storedPassword)) {
+        respond(401, ['error' => 'Username atau password salah']);
+    }
 
-upgrade_hash_if_needed($userId, $passwordInput, $storedPassword);
+    upgrade_hash_if_needed($userId, $passwordInput, $storedPassword);
 
-$namaGudang = trim((string)($matched['nama_gudang'] ?? ''));
-$type = stripos($namaGudang, 'dinkes') !== false ? 'DINKES' : 'PUSKESMAS';
+    $namaGudang = trim((string)($matched['nama_gudang'] ?? ''));
+    $type = stripos($namaGudang, 'dinkes') !== false ? 'DINKES' : 'PUSKESMAS';
 
-$payload = [
-    'sub' => $userId,
-    'username' => (string)($matched['username'] ?? ''),
-    'role' => (string)($matched['role'] ?? ''),
-    'type' => $type,
-    'id_gudang' => (int)($matched['id_gudang'] ?? 0),
-    'nama_gudang' => $namaGudang,
-];
-
-$token = jwt_sign(
-    $payload,
-    (string)$config['jwt_secret'],
-    (int)$config['jwt_ttl_seconds']
-);
-
-respond(200, [
-    'token' => $token,
-    'user' => [
-        'id' => $userId,
+    $payload = [
+        'sub' => $userId,
         'username' => (string)($matched['username'] ?? ''),
         'role' => (string)($matched['role'] ?? ''),
         'type' => $type,
         'id_gudang' => (int)($matched['id_gudang'] ?? 0),
         'nama_gudang' => $namaGudang,
-        'warehouse' => [
-            'code' => (int)($matched['id_gudang'] ?? 0),
-            'id_gudang' => (int)($matched['id_gudang'] ?? 0),
-            'name' => $namaGudang,
-            'nama_gudang' => $namaGudang,
+    ];
+
+    $token = jwt_sign(
+        $payload,
+        (string)$config['jwt_secret'],
+        (int)$config['jwt_ttl_seconds']
+    );
+
+    respond(200, [
+        'token' => $token,
+        'user' => [
+            'id' => $userId,
+            'username' => (string)($matched['username'] ?? ''),
+            'role' => (string)($matched['role'] ?? ''),
             'type' => $type,
+            'id_gudang' => (int)($matched['id_gudang'] ?? 0),
+            'nama_gudang' => $namaGudang,
+            'warehouse' => [
+                'code' => (int)($matched['id_gudang'] ?? 0),
+                'id_gudang' => (int)($matched['id_gudang'] ?? 0),
+                'name' => $namaGudang,
+                'nama_gudang' => $namaGudang,
+                'type' => $type,
+            ],
         ],
-    ],
-]);
+    ]);
+} catch (Throwable $e) {
+    error_log('LOGIN ERROR: ' . $e->getMessage());
+    error_log($e->getTraceAsString());
+
+    respond(500, [
+        'error' => 'Internal Server Error',
+        'message' => 'Terjadi kesalahan pada server',
+    ]);
+}
