@@ -5,24 +5,19 @@ declare(strict_types=1);
 if (!function_exists('app_env')) {
     function app_env(): string
     {
-        return strtolower((string)(getenv('APP_ENV') ?: 'prod'));
+        return 'prod';
     }
 }
 
-$allowedOrigins = array_filter(
-    array_map('trim', explode(',', (string)(getenv('CORS_ALLOWED_ORIGINS') ?: '')))
-);
-
-if (!$allowedOrigins) {
-    $allowedOrigins = [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-        'http://localhost:5174',
-        'http://127.0.0.1:5174',
-        'http://localhost',
-        'http://127.0.0.1',
-    ];
-}
+$allowedOrigins = [
+    'https://sistemgudangobat.netlify.app',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174',
+    'http://localhost',
+    'http://127.0.0.1',
+];
 
 $origin = (string)($_SERVER['HTTP_ORIGIN'] ?? '');
 
@@ -30,7 +25,7 @@ if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
     header("Access-Control-Allow-Origin: {$origin}");
     header('Vary: Origin');
 } else {
-    header("Access-Control-Allow-Origin: {$allowedOrigins[0]}");
+    header('Access-Control-Allow-Origin: https://sistemgudangobat.netlify.app');
     header('Vary: Origin');
 }
 
@@ -45,13 +40,13 @@ if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'OPTIONS') {
 
 return [
     'db' => [
-        'host' => (string)(getenv('DB_HOST') ?: '127.0.0.1'),
-        'port' => (int)(getenv('DB_PORT') ?: 3306),
-        'user' => (string)(getenv('DB_USER') ?: 'root'),
-        'pass' => (string)(getenv('DB_PASS') ?: ''),
-        'name' => (string)(getenv('DB_NAME') ?: 'sigudob_db'),
-        'charset' => (string)(getenv('DB_CHARSET') ?: 'utf8mb4'),
+        'host' => 'localhost',
+        'port' => 3306,
+        'user' => 'syallom',
+        'pass' => 'a6NJ18YQ9bbF',
+        'name' => 'syallom',
+        'charset' => 'utf8mb4',
     ],
-    'jwt_secret' => (string)(getenv('JWT_SECRET') ?: 'sigudob-dev-secret-change-this'),
-    'jwt_ttl_seconds' => (int)(getenv('JWT_TTL_SECONDS') ?: 60 * 60 * 8),
+    'jwt_secret' => 'sigudob-production-secret-ubah-ke-random-yang-panjang',
+    'jwt_ttl_seconds' => 60 * 60 * 8,
 ];
