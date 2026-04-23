@@ -1,398 +1,486 @@
 <?php
 // FILE: backend/api/permintaan.php
 
+declare(strict_types=1);
+
 require_once __DIR__ . '/_bootstrap.php';
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/auth.php';
-require_once __DIR__ . '/../lib/audit.php';
 
 $payload = require_auth();
-require_role($payload, ['puskesmas', 'dinkes']);
 $me = auth_ctx($payload);
 
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$role = strtolower(trim((string)($me['role'] ?? '')));
+$method = request_method();
 
-function gen_no_mutasi(): string {
-  return 'MUT-' . date('YmdHis') . '-' . substr((string)mt_rand(1000, 9999), 0, 4);
-}
-
-/**
- * FIFO allocate qty for a given obat from stok_batch (gudang sumber),
- * ordering by exp_date ASC then id_batch ASC.
- *
- * Returns array of [id_batch => qty_alloc]
- * Throws Exception if stock insufficient.
- */
-function fifo_allocate_batches(int $idGudangSumber, int $idObat, int $qtyNeed, PDO $pdo): array {
-  if ($qtyNeed <= 0) return [];
-
-  // Lock rows to avoid race (best effort)
-  $rows = db_all(
-    "SELECT sb.id_batch, sb.stok, b.exp_date
-     FROM stok_batch sb
-     JOIN data_batch b ON b.id_batch = sb.id_batch
-     WHERE sb.id_gudang = ?
-       AND b.id_obat = ?
-       AND sb.stok > 0
-     ORDER BY (b.exp_date IS NULL) ASC, b.exp_date ASC, sb.id_batch ASC
-     FOR UPDATE",
-    [$idGudangSumber, $idObat]
-  );
-
-  $alloc = [];
-  $remain = $qtyNeed;
-
-  foreach ($rows as $r) {
-    if ($remain <= 0) break;
-    $idBatch = (int)$r['id_batch'];
-    $stok = (int)$r['stok'];
-
-    if ($stok <= 0) continue;
-
-    $take = min($stok, $remain);
-    if ($take > 0) {
-      $alloc[$idBatch] = ($alloc[$idBatch] ?? 0) + $take;
-      $remain -= $take;
+function permintaan_input(): array
+{
+    $data = request_input();
+    if (!empty($data)) {
+        return $data;
     }
-  }
 
-  if ($remain > 0) {
-    throw new Exception("Stok tidak cukup untuk obat_id=$idObat. Kurang: $remain");
-  }
+    $raw = file_get_contents('php://input');
+    if (is_string($raw) && trim($raw) !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            return $decoded;
+        }
 
-  return $alloc;
-}
-
-/**
- * Ensure there is a workflow mutasi linked to permintaan_id.
- * Returns mutasi id.
- */
-function ensure_workflow_mutasi(int $permintaanId, array $hdr, array $me): int {
-  // Try existing
-  $existing = db_one(
-    "SELECT id FROM mutasi WHERE permintaan_id=? AND mode='WORKFLOW' ORDER BY id DESC LIMIT 1",
-    [$permintaanId]
-  );
-  if ($existing && (int)$existing['id'] > 0) return (int)$existing['id'];
-
-  // Create new mutasi header
-  // Distribusi: sumber = gudang dinkes (me.id_gudang), tujuan = gudang puskesmas (hdr.from_gudang_id)
-  $sumber = (int)$me['id_gudang'];
-  $tujuan = (int)($hdr['from_gudang_id'] ?? 0);
-  if ($tujuan <= 0) throw new Exception("from_gudang_id tidak valid pada permintaan");
-
-  $stmt = db()->prepare(
-    "INSERT INTO mutasi (no_mutasi, tanggal, sumber, tujuan, penyerah, penerima, catatan, id_admin, permintaan_id, mode, status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-  );
-  $stmt->execute([
-    gen_no_mutasi(),
-    date('Y-m-d'),
-    $sumber,
-    $tujuan,
-    (string)($me['username'] ?? 'Admin Dinkes'),
-    null,
-    'Distribusi (auto dari permintaan #' . $permintaanId . ')',
-    (int)$me['user_id'],
-    $permintaanId,
-    'WORKFLOW',
-    'DRAFT',
-  ]);
-
-  return (int)db()->lastInsertId();
-}
-
-/**
- * Auto fill mutasi_detail based on permintaan_detail qty_approved (or qty_requested if approved null).
- * - Clears previous mutasi_detail for that mutasi (safe if rerun).
- * - Inserts mutasi_detail (jumlah, qty_received NULL) using FIFO.
- */
-function autofill_mutasi_detail_from_permintaan(int $mutasiId, int $permintaanId, array $me, PDO $pdo): void {
-  $idGudangSumber = (int)$me['id_gudang'];
-
-  // Get approved items
-  $items = db_all(
-    "SELECT id, obat_id,
-            COALESCE(qty_approved, qty_requested, 0) AS qty_need
-     FROM permintaan_detail
-     WHERE permintaan_id=?
-     ORDER BY id ASC",
-    [$permintaanId]
-  );
-
-  // Clear existing details to avoid duplicates
-  db_exec("DELETE FROM mutasi_detail WHERE id_mutasi=?", [$mutasiId]);
-
-  foreach ($items as $it) {
-    $obatId = (int)$it['obat_id'];
-    $qtyNeed = (int)$it['qty_need'];
-
-    if ($qtyNeed <= 0) continue;
-
-    $alloc = fifo_allocate_batches($idGudangSumber, $obatId, $qtyNeed, $pdo);
-
-    foreach ($alloc as $idBatch => $qtyAlloc) {
-      db_exec(
-        "INSERT INTO mutasi_detail (id_mutasi, id_batch, jumlah, qty_received)
-         VALUES (?,?,?,NULL)",
-        [$mutasiId, (int)$idBatch, (int)$qtyAlloc]
-      );
+        parse_str($raw, $parsed);
+        if (is_array($parsed)) {
+            return $parsed;
+        }
     }
-  }
+
+    return [];
 }
 
-function json_body(): array {
-  $raw = file_get_contents('php://input');
-  $b = json_decode($raw ?: '[]', true);
-  return is_array($b) ? $b : [];
+function permintaan_header(int $id): ?array
+{
+    $row = db_one(
+        "SELECT
+            p.id,
+            p.from_gudang_id,
+            p.to_gudang_id,
+            p.priority,
+            p.note,
+            p.status,
+            p.created_at,
+            p.updated_at,
+            gf.nama_gudang AS from_gudang_nama,
+            gt.nama_gudang AS to_gudang_nama
+         FROM permintaan p
+         LEFT JOIN gudang gf ON gf.id_gudang = p.from_gudang_id
+         LEFT JOIN gudang gt ON gt.id_gudang = p.to_gudang_id
+         WHERE p.id = ?
+         LIMIT 1",
+        [$id]
+    );
+
+    return $row ?: null;
 }
 
-/**
- * Expected table columns (based on your UI & workflow):
- * permintaan:
- * - id
- * - from_gudang_id
- * - to_gudang_id
- * - priority
- * - note
- * - status (DRAFT|SUBMITTED|APPROVED|PARTIAL|ON_DELIVERY|REJECTED|FULFILLED)
- * - created_at
- *
- * permintaan_detail:
- * - id
- * - permintaan_id
- * - obat_id
- * - qty_requested
- * - qty_approved (nullable)
- */
+function permintaan_detail_rows(int $id): array
+{
+    return db_all(
+        "SELECT
+            pd.id,
+            pd.permintaan_id,
+            pd.obat_id,
+            pd.qty_requested,
+            pd.qty_approved,
+            o.nama AS nama_obat,
+            o.satuan
+         FROM permintaan_detail pd
+         LEFT JOIN data_obat o ON o.id_obat = pd.obat_id
+         WHERE pd.permintaan_id = ?
+         ORDER BY pd.id ASC",
+        [$id]
+    );
+}
+
+function permintaan_can_view(array $header, string $role, int $myGudangId): bool
+{
+    if ($role === 'dinkes' && (int)$header['to_gudang_id'] === $myGudangId) {
+        return true;
+    }
+
+    if ($role === 'puskesmas' && (int)$header['from_gudang_id'] === $myGudangId) {
+        return true;
+    }
+
+    return false;
+}
+
+function permintaan_ensure_gudang_exists(int $idGudang): void
+{
+    $row = db_one(
+        "SELECT id_gudang
+         FROM gudang
+         WHERE id_gudang = ?
+         LIMIT 1",
+        [$idGudang]
+    );
+
+    if (!$row) {
+        respond(422, ['error' => 'Gudang tidak ditemukan']);
+    }
+}
+
+function permintaan_find_dinkes_gudang_id(): int
+{
+    $row = db_one(
+        "SELECT id_gudang
+         FROM gudang
+         WHERE LOWER(TRIM(jenis_gudang)) = 'dinkes'
+         ORDER BY id_gudang ASC
+         LIMIT 1"
+    );
+
+    if ($row && (int)($row['id_gudang'] ?? 0) > 0) {
+        return (int)$row['id_gudang'];
+    }
+
+    $row = db_one(
+        "SELECT id_gudang
+         FROM gudang
+         WHERE LOWER(TRIM(nama_gudang)) LIKE '%dinkes%'
+         ORDER BY id_gudang ASC
+         LIMIT 1"
+    );
+
+    if ($row && (int)($row['id_gudang'] ?? 0) > 0) {
+        return (int)$row['id_gudang'];
+    }
+
+    respond(500, ['error' => 'Gudang dinkes tidak ditemukan']);
+
+    throw new RuntimeException('Gudang dinkes tidak ditemukan');
+}
 
 if ($method === 'GET') {
-  $id = (int)($_GET['id'] ?? 0);
+    try {
+        $id = (int)($_GET['id'] ?? 0);
+        $myGudangId = (int)($me['id_gudang'] ?? 0);
 
-  if ($id > 0) {
-    $hdr = db_one(
-      "SELECT p.*,
-              g1.nama_gudang AS nama_from,
-              g2.nama_gudang AS nama_to
-       FROM permintaan p
-       JOIN gudang g1 ON g1.id_gudang = p.from_gudang_id
-       JOIN gudang g2 ON g2.id_gudang = p.to_gudang_id
-       WHERE p.id=? LIMIT 1",
-      [$id]
-    );
-    if (!$hdr) respond(404, ['error' => 'Permintaan tidak ditemukan']);
+        if ($id > 0) {
+            $header = permintaan_header($id);
 
-    // authorization: puskesmas only own, dinkes only own target
-    if ($me['role'] === 'puskesmas' && (int)$hdr['from_gudang_id'] !== (int)$me['id_gudang']) {
-      respond(403, ['error' => 'Forbidden']);
+            if (!$header) {
+                respond(404, ['error' => 'Permintaan tidak ditemukan']);
+            }
+
+            if (!permintaan_can_view($header, $role, $myGudangId)) {
+                respond(403, ['error' => 'Forbidden']);
+            }
+
+            respond(200, [
+                'header' => $header,
+                'detail' => permintaan_detail_rows($id),
+            ]);
+        }
+
+        if ($role === 'dinkes') {
+            $rows = db_all(
+                "SELECT
+                    p.id,
+                    p.from_gudang_id,
+                    p.to_gudang_id,
+                    p.priority,
+                    p.note,
+                    p.status,
+                    p.created_at,
+                    p.updated_at,
+                    gf.nama_gudang AS from_gudang_nama,
+                    gt.nama_gudang AS to_gudang_nama,
+                    COUNT(pd.id) AS total_item
+                 FROM permintaan p
+                 LEFT JOIN gudang gf ON gf.id_gudang = p.from_gudang_id
+                 LEFT JOIN gudang gt ON gt.id_gudang = p.to_gudang_id
+                 LEFT JOIN permintaan_detail pd ON pd.permintaan_id = p.id
+                 WHERE p.to_gudang_id = ?
+                 GROUP BY
+                    p.id, p.from_gudang_id, p.to_gudang_id, p.priority, p.note,
+                    p.status, p.created_at, p.updated_at,
+                    gf.nama_gudang, gt.nama_gudang
+                 ORDER BY p.id DESC",
+                [$myGudangId]
+            );
+
+            respond(200, $rows);
+        }
+
+        if ($role === 'puskesmas') {
+            $rows = db_all(
+                "SELECT
+                    p.id,
+                    p.from_gudang_id,
+                    p.to_gudang_id,
+                    p.priority,
+                    p.note,
+                    p.status,
+                    p.created_at,
+                    p.updated_at,
+                    gf.nama_gudang AS from_gudang_nama,
+                    gt.nama_gudang AS to_gudang_nama,
+                    COUNT(pd.id) AS total_item
+                 FROM permintaan p
+                 LEFT JOIN gudang gf ON gf.id_gudang = p.from_gudang_id
+                 LEFT JOIN gudang gt ON gt.id_gudang = p.to_gudang_id
+                 LEFT JOIN permintaan_detail pd ON pd.permintaan_id = p.id
+                 WHERE p.from_gudang_id = ?
+                 GROUP BY
+                    p.id, p.from_gudang_id, p.to_gudang_id, p.priority, p.note,
+                    p.status, p.created_at, p.updated_at,
+                    gf.nama_gudang, gt.nama_gudang
+                 ORDER BY p.id DESC",
+                [$myGudangId]
+            );
+
+            respond(200, $rows);
+        }
+
+        respond(403, ['error' => 'Forbidden']);
+    } catch (Throwable $e) {
+        respond(500, [
+            'error' => 'Gagal memuat data permintaan',
+            'detail' => $e->getMessage(),
+        ]);
     }
-    if ($me['role'] === 'dinkes' && (int)$hdr['to_gudang_id'] !== (int)$me['id_gudang']) {
-      respond(403, ['error' => 'Forbidden']);
-    }
-
-    $items = db_all(
-      "SELECT pd.*,
-              o.nama AS nama_obat,
-              o.satuan
-       FROM permintaan_detail pd
-       JOIN data_obat o ON o.id_obat = pd.obat_id
-       WHERE pd.permintaan_id=?
-       ORDER BY pd.id ASC",
-      [$id]
-    );
-
-    respond(200, ['permintaan' => $hdr, 'items' => $items]);
-  }
-
-  // list
-  if ($me['role'] === 'puskesmas') {
-    $rows = db_all(
-      "SELECT p.id, p.status, p.priority, p.note, p.created_at,
-              g2.nama_gudang AS nama_to
-       FROM permintaan p
-       JOIN gudang g2 ON g2.id_gudang = p.to_gudang_id
-       WHERE p.from_gudang_id=?
-       ORDER BY p.id DESC",
-      [$me['id_gudang']]
-    );
-    respond(200, $rows);
-  }
-
-  // dinkes inbox
-  $rows = db_all(
-    "SELECT p.id, p.status, p.priority, p.note, p.created_at,
-            g1.nama_gudang AS nama_from
-     FROM permintaan p
-     JOIN gudang g1 ON g1.id_gudang = p.from_gudang_id
-     WHERE p.to_gudang_id=?
-     ORDER BY p.id DESC",
-    [$me['id_gudang']]
-  );
-  respond(200, $rows);
 }
 
 if ($method === 'POST') {
-  $b = json_body();
-  $type = (string)($b['type'] ?? '');
-
-  // create master (puskesmas)
-  if ($type === 'master') {
-    require_role($payload, ['puskesmas']);
-
-    $toGudang = (int)($b['to_gudang_id'] ?? 0);
-    if ($toGudang <= 0) respond(400, ['error' => 'to_gudang_id wajib']);
-
-    $priority = (string)($b['priority'] ?? 'MEDIUM');
-    if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH'], true)) $priority = 'MEDIUM';
-
-    $note = trim((string)($b['note'] ?? ''));
-
-    $stmt = db()->prepare(
-      "INSERT INTO permintaan (from_gudang_id, to_gudang_id, priority, note, status, created_at)
-       VALUES (?,?,?,?, 'DRAFT', NOW())"
-    );
-    $stmt->execute([(int)$me['id_gudang'], $toGudang, $priority, $note ?: null]);
-
-    $id = (int)db()->lastInsertId();
-    audit_log((int)$me['user_id'], 'CREATE', 'permintaan', $id, ['to_gudang_id' => $toGudang]);
-
-    respond(201, ['id' => $id, 'message' => 'Permintaan dibuat (Draft)']);
-  }
-
-  // add detail item (puskesmas)
-  if ($type === 'detail') {
-    require_role($payload, ['puskesmas']);
-
-    $permintaanId = (int)($b['permintaan_id'] ?? 0);
-    $obatId = (int)($b['obat_id'] ?? 0);
-    $qtyReq = (int)($b['qty_requested'] ?? 0);
-
-    if ($permintaanId <= 0 || $obatId <= 0 || $qtyReq <= 0) respond(400, ['error' => 'permintaan_id, obat_id, qty_requested wajib']);
-
-    $hdr = db_one("SELECT * FROM permintaan WHERE id=? LIMIT 1", [$permintaanId]);
-    if (!$hdr) respond(404, ['error' => 'Permintaan tidak ditemukan']);
-    if ((int)$hdr['from_gudang_id'] !== (int)$me['id_gudang']) respond(403, ['error' => 'Forbidden']);
-    if ((string)$hdr['status'] !== 'DRAFT') respond(400, ['error' => 'Hanya bisa tambah item saat DRAFT']);
-
-    db_exec(
-      "INSERT INTO permintaan_detail (permintaan_id, obat_id, qty_requested, qty_approved)
-       VALUES (?,?,?,NULL)",
-      [$permintaanId, $obatId, $qtyReq]
-    );
-
-    audit_log((int)$me['user_id'], 'ADD_ITEM', 'permintaan', $permintaanId, ['obat_id' => $obatId, 'qty' => $qtyReq]);
-
-    respond(201, ['message' => 'Item ditambahkan']);
-  }
-
-  respond(400, ['error' => 'type tidak valid']);
-}
-
-if ($method === 'PUT') {
-  $b = json_body();
-  $action = (string)($b['action'] ?? '');
-  $id = (int)($b['id'] ?? 0);
-  if ($id <= 0) respond(400, ['error' => 'id wajib']);
-
-  $hdr = db_one("SELECT * FROM permintaan WHERE id=? LIMIT 1", [$id]);
-  if (!$hdr) respond(404, ['error' => 'Permintaan tidak ditemukan']);
-
-  // submit (puskesmas)
-  if ($action === 'submit') {
-    require_role($payload, ['puskesmas']);
-    if ((int)$hdr['from_gudang_id'] !== (int)$me['id_gudang']) respond(403, ['error' => 'Forbidden']);
-    if ((string)$hdr['status'] !== 'DRAFT') respond(400, ['error' => 'Harus DRAFT']);
-
-    $cnt = db_one("SELECT COUNT(*) AS c FROM permintaan_detail WHERE permintaan_id=?", [$id]);
-    if ((int)($cnt['c'] ?? 0) <= 0) respond(400, ['error' => 'Item belum ada']);
-
-    db_exec("UPDATE permintaan SET status='SUBMITTED' WHERE id=?", [$id]);
-    audit_log((int)$me['user_id'], 'SUBMIT', 'permintaan', $id, []);
-
-    respond(200, ['message' => 'Permintaan diajukan']);
-  }
-
-  // reject (dinkes)
-  if ($action === 'reject') {
-    require_role($payload, ['dinkes']);
-    if ((int)$hdr['to_gudang_id'] !== (int)$me['id_gudang']) respond(403, ['error' => 'Forbidden']);
-    if ((string)$hdr['status'] !== 'SUBMITTED') respond(400, ['error' => 'Harus SUBMITTED']);
-
-    $note = trim((string)($b['note'] ?? 'Ditolak'));
-    db_exec("UPDATE permintaan SET status='REJECTED', note=? WHERE id=?", [$note ?: null, $id]);
-
-    audit_log((int)$me['user_id'], 'REJECT', 'permintaan', $id, ['note' => $note]);
-    respond(200, ['message' => 'Permintaan ditolak']);
-  }
-
-  // approve (dinkes) + AUTO-FILL DISTRIBUSI FIFO ✅
-  if ($action === 'approve') {
-    require_role($payload, ['dinkes']);
-    if ((int)$hdr['to_gudang_id'] !== (int)$me['id_gudang']) respond(403, ['error' => 'Forbidden']);
-    if ((string)$hdr['status'] !== 'SUBMITTED') respond(400, ['error' => 'Harus SUBMITTED']);
-
-    $items = $b['items'] ?? null;
-    if (!is_array($items) || count($items) === 0) respond(400, ['error' => 'items wajib']);
-
-    $pdo = db();
-    $pdo->beginTransaction();
+    $b = permintaan_input();
+    $type = strtolower(trim((string)($b['type'] ?? 'master')));
+    $myGudangId = (int)($me['id_gudang'] ?? 0);
 
     try {
-      $anyPartial = false;
+        if ($type === 'master') {
+            if ($role !== 'puskesmas') {
+                respond(403, ['error' => 'Hanya puskesmas yang dapat membuat permintaan']);
+            }
 
-      foreach ($items as $it) {
-        $detailId = (int)($it['detail_id'] ?? 0);
-        if ($detailId <= 0) continue;
+            $priority = strtoupper(trim((string)($b['priority'] ?? 'MEDIUM')));
+            $note = trim((string)($b['note'] ?? ''));
+            $details = is_array($b['details'] ?? null) ? $b['details'] : [];
 
-        $row = db_one(
-          "SELECT qty_requested FROM permintaan_detail WHERE id=? AND permintaan_id=? LIMIT 1",
-          [$detailId, $id]
-        );
-        if (!$row) continue;
+            if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH'], true)) {
+                $priority = 'MEDIUM';
+            }
 
-        $qtyReq = (int)($row['qty_requested'] ?? 0);
-        $qtyA = (int)($it['qty_approved'] ?? 0);
+            if (empty($details)) {
+                respond(422, ['error' => 'Detail permintaan wajib diisi']);
+            }
 
-        if ($qtyA < 0) $qtyA = 0;
-        if ($qtyA > $qtyReq) $qtyA = $qtyReq;
+            $toGudangId = (int)($b['to_gudang_id'] ?? 0);
+            if ($toGudangId <= 0) {
+                $toGudangId = permintaan_find_dinkes_gudang_id();
+            }
 
-        if ($qtyA < $qtyReq) $anyPartial = true;
+            permintaan_ensure_gudang_exists($myGudangId);
+            permintaan_ensure_gudang_exists($toGudangId);
 
-        db_exec(
-          "UPDATE permintaan_detail SET qty_approved=? WHERE id=? AND permintaan_id=?",
-          [$qtyA, $detailId, $id]
-        );
-      }
+            $pdo = db();
+            $pdo->beginTransaction();
 
-      $newStatus = $anyPartial ? 'PARTIAL' : 'APPROVED';
-      db_exec("UPDATE permintaan SET status=? WHERE id=?", [$newStatus, $id]);
+            try {
+                $stmt = $pdo->prepare(
+                    "INSERT INTO permintaan
+                        (from_gudang_id, to_gudang_id, priority, note, status)
+                     VALUES
+                        (?, ?, ?, ?, 'DRAFT')"
+                );
+                $stmt->execute([
+                    $myGudangId,
+                    $toGudangId,
+                    $priority,
+                    $note !== '' ? $note : null,
+                ]);
 
-      // ✅ ensure mutasi header exists (WORKFLOW)
-      $mutasiId = ensure_workflow_mutasi($id, $hdr, $me);
+                $idPermintaan = (int)$pdo->lastInsertId();
 
-      // ✅ auto-fill mutasi_detail using FIFO batches
-      autofill_mutasi_detail_from_permintaan($mutasiId, $id, $me, $pdo);
+                $stmt = $pdo->prepare(
+                    "INSERT INTO permintaan_detail
+                        (permintaan_id, obat_id, qty_requested, qty_approved)
+                     VALUES
+                        (?, ?, ?, 0)"
+                );
 
-      audit_log((int)$me['user_id'], 'APPROVE', 'permintaan', $id, [
-        'status' => $newStatus,
-        'mutasi_id' => $mutasiId,
-        'autofill' => true,
-      ]);
+                foreach ($details as $item) {
+                    $obatId = (int)($item['obat_id'] ?? 0);
+                    $qtyRequested = (float)($item['qty_requested'] ?? 0);
 
-      $pdo->commit();
+                    if ($obatId <= 0 || $qtyRequested <= 0) {
+                        continue;
+                    }
 
-      respond(200, [
-        'message' => 'Permintaan disetujui & distribusi otomatis dibuat (FIFO)',
-        'status' => $newStatus,
-        'mutasi_id' => $mutasiId,
-      ]);
+                    $stmt->execute([
+                        $idPermintaan,
+                        $obatId,
+                        $qtyRequested,
+                    ]);
+                }
+
+                $detailCount = (int)$pdo->query(
+                    "SELECT COUNT(*) FROM permintaan_detail WHERE permintaan_id = " . $idPermintaan
+                )->fetchColumn();
+
+                if ($detailCount <= 0) {
+                    $pdo->rollBack();
+                    respond(422, ['error' => 'Minimal 1 item permintaan harus valid']);
+                }
+
+                $pdo->commit();
+
+                respond(201, [
+                    'message' => 'Permintaan berhasil dibuat',
+                    'header' => permintaan_header($idPermintaan),
+                    'detail' => permintaan_detail_rows($idPermintaan),
+                ]);
+            } catch (Throwable $e) {
+                $pdo->rollBack();
+                throw $e;
+            }
+        }
+
+        if ($type === 'submit') {
+            if ($role !== 'puskesmas') {
+                respond(403, ['error' => 'Hanya puskesmas yang dapat mengajukan permintaan']);
+            }
+
+            $permintaanId = (int)($b['permintaan_id'] ?? 0);
+            if ($permintaanId <= 0) {
+                respond(422, ['error' => 'permintaan_id wajib diisi']);
+            }
+
+            $header = permintaan_header($permintaanId);
+            if (!$header) {
+                respond(404, ['error' => 'Permintaan tidak ditemukan']);
+            }
+
+            if ((int)$header['from_gudang_id'] !== $myGudangId) {
+                respond(403, ['error' => 'Forbidden']);
+            }
+
+            if (strtoupper(trim((string)$header['status'])) !== 'DRAFT') {
+                respond(422, ['error' => 'Hanya permintaan DRAFT yang dapat diajukan']);
+            }
+
+            db()->prepare(
+                "UPDATE permintaan
+                 SET status = 'SUBMITTED', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?"
+            )->execute([$permintaanId]);
+
+            respond(200, [
+                'message' => 'Permintaan berhasil diajukan',
+                'header' => permintaan_header($permintaanId),
+                'detail' => permintaan_detail_rows($permintaanId),
+            ]);
+        }
+
+        if ($type === 'approve') {
+            if ($role !== 'dinkes') {
+                respond(403, ['error' => 'Hanya dinkes yang dapat menyetujui permintaan']);
+            }
+
+            $permintaanId = (int)($b['permintaan_id'] ?? 0);
+            if ($permintaanId <= 0) {
+                respond(422, ['error' => 'permintaan_id wajib diisi']);
+            }
+
+            $header = permintaan_header($permintaanId);
+            if (!$header) {
+                respond(404, ['error' => 'Permintaan tidak ditemukan']);
+            }
+
+            if ((int)$header['to_gudang_id'] !== $myGudangId) {
+                respond(403, ['error' => 'Forbidden']);
+            }
+
+            if (strtoupper(trim((string)$header['status'])) !== 'SUBMITTED') {
+                respond(422, ['error' => 'Hanya permintaan SUBMITTED yang dapat disetujui']);
+            }
+
+            $pdo = db();
+            $pdo->beginTransaction();
+
+            try {
+                $items = is_array($b['items'] ?? null) ? $b['items'] : [];
+
+                if (!empty($items)) {
+                    $stmt = $pdo->prepare(
+                        "UPDATE permintaan_detail
+                         SET qty_approved = ?
+                         WHERE id = ? AND permintaan_id = ?"
+                    );
+
+                    foreach ($items as $item) {
+                        $detailId = (int)($item['id'] ?? 0);
+                        $qtyApproved = (float)($item['qty_approved'] ?? 0);
+
+                        if ($detailId <= 0) {
+                            continue;
+                        }
+
+                        $stmt->execute([
+                            max(0, $qtyApproved),
+                            $detailId,
+                            $permintaanId,
+                        ]);
+                    }
+                }
+
+                $pdo->prepare(
+                    "UPDATE permintaan_detail
+                     SET qty_approved = qty_requested
+                     WHERE permintaan_id = ?
+                       AND COALESCE(qty_approved, 0) <= 0"
+                )->execute([$permintaanId]);
+
+                $pdo->prepare(
+                    "UPDATE permintaan
+                     SET status = 'APPROVED', updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?"
+                )->execute([$permintaanId]);
+
+                $pdo->commit();
+
+                respond(200, [
+                    'message' => 'Permintaan berhasil disetujui',
+                    'header' => permintaan_header($permintaanId),
+                    'detail' => permintaan_detail_rows($permintaanId),
+                ]);
+            } catch (Throwable $e) {
+                $pdo->rollBack();
+                throw $e;
+            }
+        }
+
+        if ($type === 'reject') {
+            if ($role !== 'dinkes') {
+                respond(403, ['error' => 'Hanya dinkes yang dapat menolak permintaan']);
+            }
+
+            $permintaanId = (int)($b['permintaan_id'] ?? 0);
+            if ($permintaanId <= 0) {
+                respond(422, ['error' => 'permintaan_id wajib diisi']);
+            }
+
+            $header = permintaan_header($permintaanId);
+            if (!$header) {
+                respond(404, ['error' => 'Permintaan tidak ditemukan']);
+            }
+
+            if ((int)$header['to_gudang_id'] !== $myGudangId) {
+                respond(403, ['error' => 'Forbidden']);
+            }
+
+            if (strtoupper(trim((string)$header['status'])) !== 'SUBMITTED') {
+                respond(422, ['error' => 'Hanya permintaan SUBMITTED yang dapat ditolak']);
+            }
+
+            db()->prepare(
+                "UPDATE permintaan
+                 SET status = 'REJECTED', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?"
+            )->execute([$permintaanId]);
+
+            respond(200, [
+                'message' => 'Permintaan berhasil ditolak',
+                'header' => permintaan_header($permintaanId),
+                'detail' => permintaan_detail_rows($permintaanId),
+            ]);
+        }
+
+        respond(422, ['error' => 'type tidak valid']);
     } catch (Throwable $e) {
-      $pdo->rollBack();
-      respond(400, ['error' => $e->getMessage()]);
+        respond(500, [
+            'error' => 'Gagal memproses permintaan',
+            'detail' => $e->getMessage(),
+        ]);
     }
-  }
-
-  respond(400, ['error' => 'action tidak valid']);
 }
 
 respond(405, ['error' => 'Method not allowed']);

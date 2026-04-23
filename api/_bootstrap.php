@@ -1,4 +1,5 @@
 <?php
+// FILE: backend/api/_bootstrap.php
 
 declare(strict_types=1);
 
@@ -6,7 +7,7 @@ if (ob_get_level() === 0) {
     ob_start();
 }
 
-require_once __DIR__ . '/../config.php';
+$config = require __DIR__ . '/../config.php';
 
 ini_set('display_errors', '0');
 ini_set('display_startup_errors', '0');
@@ -15,7 +16,7 @@ error_reporting(E_ALL);
 
 function apply_cors(array $allowedOrigins = []): void
 {
-    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+    $origin = (string) ($_SERVER['HTTP_ORIGIN'] ?? '');
 
     if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
         header("Access-Control-Allow-Origin: {$origin}");
@@ -24,20 +25,21 @@ function apply_cors(array $allowedOrigins = []): void
     }
 
     header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, Authorization');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
     header('Content-Type: application/json; charset=utf-8');
 
-    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'OPTIONS') {
+    if (strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'OPTIONS') {
         http_response_code(204);
         exit;
     }
 }
 
-apply_cors([
-    'https://sistemgudangobat.netlify.app',
-    'http://localhost:3000',
-    'http://localhost:5173',
-]);
+$allowedOrigins = [];
+if (isset($config['app']['allowed_origins']) && is_array($config['app']['allowed_origins'])) {
+    $allowedOrigins = $config['app']['allowed_origins'];
+}
+
+apply_cors($allowedOrigins);
 
 function json_input(): array
 {
@@ -48,6 +50,7 @@ function json_input(): array
     }
 
     $raw = file_get_contents('php://input');
+
     if (!is_string($raw) || trim($raw) === '') {
         $cached = [];
         return $cached;
@@ -88,12 +91,19 @@ function respond(int $code, array $payload): void
 
 function bearer_token(): ?string
 {
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['Authorization'] ?? '';
+    $header =
+        $_SERVER['HTTP_AUTHORIZATION'] ??
+        $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ??
+        $_SERVER['Authorization'] ??
+        '';
 
     if ($header === '' && function_exists('apache_request_headers')) {
         $headers = apache_request_headers();
         if (is_array($headers)) {
-            $header = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+            $header =
+                $headers['Authorization'] ??
+                $headers['authorization'] ??
+                '';
         }
     }
 
@@ -102,7 +112,8 @@ function bearer_token(): ?string
     }
 
     if (preg_match('/^\s*Bearer\s+(.+?)\s*$/i', $header, $matches)) {
-        return trim($matches[1]) !== '' ? trim($matches[1]) : null;
+        $token = trim($matches[1]);
+        return $token !== '' ? $token : null;
     }
 
     return null;

@@ -1,171 +1,301 @@
 <?php
+// FILE: backend/api/master_user.php
+
+declare(strict_types=1);
+
 require_once __DIR__ . '/_bootstrap.php';
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
 
-function require_dinkes(): void
+$payload = require_auth();
+$me = auth_ctx($payload);
+
+$role = strtolower(trim((string)($me['role'] ?? $payload['role'] ?? '')));
+$method = request_method();
+
+if ($role !== 'dinkes') {
+    respond(403, ['error' => 'Akses ditolak. Hanya dinkes.']);
+}
+
+function input_data(): array
 {
-    $role = $_SERVER['HTTP_X_USER_ROLE'] ?? '';
-    if (strtolower(trim((string) $role)) !== 'dinkes') {
-        respond(403, ['error' => 'Akses ditolak. Hanya dinkes.']);
+    $data = request_input();
+    if (!empty($data)) {
+        return $data;
+    }
+
+    if (in_array(request_method(), ['PUT', 'PATCH', 'DELETE'], true)) {
+        $raw = file_get_contents('php://input');
+        if (is_string($raw) && trim($raw) !== '') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+
+            parse_str($raw, $parsed);
+            if (is_array($parsed)) {
+                return $parsed;
+            }
+        }
+    }
+
+    return [];
+}
+
+function clean_role(string $value): string
+{
+    $role = strtolower(trim($value));
+    return in_array($role, ['dinkes', 'puskesmas'], true) ? $role : '';
+}
+
+function clean_name(string $value): string
+{
+    return trim($value);
+}
+
+function clean_password(string $value): string
+{
+    return trim($value);
+}
+
+function clean_gudang_id($value): int
+{
+    return (int)$value;
+}
+
+function find_user_by_id(int $id): ?array
+{
+    $row = db_one(
+        "SELECT
+            u.id_admin,
+            u.nama,
+            u.role,
+            u.id_gudang,
+            u.created_at,
+            g.nama_gudang,
+            g.kode_gudang,
+            g.jenis_gudang
+         FROM user u
+         LEFT JOIN gudang g ON g.id_gudang = u.id_gudang
+         WHERE u.id_admin = ?
+         LIMIT 1",
+        [$id]
+    );
+
+    return $row ?: null;
+}
+
+function ensure_gudang_exists(int $idGudang): void
+{
+    $gudang = db_one(
+        "SELECT id_gudang, nama_gudang
+         FROM gudang
+         WHERE id_gudang = ?
+         LIMIT 1",
+        [$idGudang]
+    );
+
+    if (!$gudang) {
+        respond(422, ['error' => 'Gudang tidak ditemukan']);
     }
 }
 
-function now_mysql(): string
+function ensure_name_unique(string $nama, ?int $excludeId = null): void
 {
-    return date('Y-m-d H:i:s');
+    if ($excludeId && $excludeId > 0) {
+        $exists = db_one(
+            "SELECT id_admin
+             FROM user
+             WHERE LOWER(TRIM(nama)) = LOWER(TRIM(?))
+               AND id_admin <> ?
+             LIMIT 1",
+            [$nama, $excludeId]
+        );
+    } else {
+        $exists = db_one(
+            "SELECT id_admin
+             FROM user
+             WHERE LOWER(TRIM(nama)) = LOWER(TRIM(?))
+             LIMIT 1",
+            [$nama]
+        );
+    }
+
+    if ($exists) {
+        respond(422, ['error' => 'Nama user sudah digunakan']);
+    }
 }
-
-require_dinkes();
-
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 try {
     if ($method === 'GET') {
+        $id = (int)($_GET['id'] ?? 0);
+
+        if ($id > 0) {
+            $row = find_user_by_id($id);
+
+            if (!$row) {
+                respond(404, ['error' => 'User tidak ditemukan']);
+            }
+
+            respond(200, $row);
+        }
+
         $rows = db_all(
-            "
-            SELECT
+            "SELECT
                 u.id_admin,
                 u.nama,
                 u.role,
                 u.id_gudang,
                 u.created_at,
-                g.nama_gudang
-            FROM `user` u
-            LEFT JOIN gudang g ON g.id_gudang = u.id_gudang
-            ORDER BY u.id_admin ASC
-            "
+                g.nama_gudang,
+                g.kode_gudang,
+                g.jenis_gudang
+             FROM user u
+             LEFT JOIN gudang g ON g.id_gudang = u.id_gudang
+             ORDER BY u.id_admin ASC"
         );
 
         respond(200, $rows);
     }
 
     if ($method === 'POST') {
-        $data = json_input();
+        $data = input_data();
 
-        $nama = trim((string) ($data['nama'] ?? ''));
-        $password = (string) ($data['password'] ?? '');
-        $role = trim((string) ($data['role'] ?? 'puskesmas'));
-        $idGudang = (int) ($data['id_gudang'] ?? 0);
+        $nama = clean_name((string)($data['nama'] ?? ''));
+        $password = clean_password((string)($data['password'] ?? ''));
+        $newRole = clean_role((string)($data['role'] ?? ''));
+        $idGudang = clean_gudang_id($data['id_gudang'] ?? 0);
 
-        if ($nama === '') {
-            respond(422, ['error' => 'Nama wajib diisi']);
+        if ($nama === '' || $password === '' || $newRole === '' || $idGudang <= 0) {
+            respond(422, ['error' => 'Field wajib: nama, password, role, id_gudang']);
         }
 
-        if ($password === '') {
-            respond(422, ['error' => 'Password wajib diisi']);
-        }
+        ensure_name_unique($nama);
+        ensure_gudang_exists($idGudang);
 
-        if (!in_array($role, ['dinkes', 'puskesmas'], true)) {
-            respond(422, ['error' => 'Role tidak valid']);
-        }
+        $hash = password_hash($password, PASSWORD_DEFAULT);
 
-        if ($idGudang <= 0) {
-            respond(422, ['error' => 'Gudang wajib dipilih']);
-        }
-
-        $exists = db_one("SELECT id_admin FROM `user` WHERE nama = ? LIMIT 1", [$nama]);
-        if ($exists) {
-            respond(409, ['error' => 'Nama user sudah digunakan']);
-        }
-
-        $hash = password_hash($password, PASSWORD_BCRYPT);
-
-        db_exec(
-            "
-            INSERT INTO `user` (nama, password, role, id_gudang, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ",
-            [$nama, $hash, $role, $idGudang, now_mysql()]
+        $stmt = db()->prepare(
+            "INSERT INTO user (nama, password, role, id_gudang)
+             VALUES (?, ?, ?, ?)"
         );
+        $stmt->execute([$nama, $hash, $newRole, $idGudang]);
 
-        $created = db_one("SELECT LAST_INSERT_ID() AS id_admin");
+        $id = (int)db()->lastInsertId();
+        $row = find_user_by_id($id);
+
         respond(201, [
-            'ok' => true,
-            'id_admin' => (int) ($created['id_admin'] ?? 0),
+            'message' => 'User berhasil ditambahkan',
+            'user' => $row,
         ]);
     }
 
-    if ($method === 'PUT') {
-        $data = json_input();
+    if ($method === 'PUT' || $method === 'PATCH') {
+        $data = input_data();
 
-        $idAdmin = (int) ($data['id_admin'] ?? 0);
-        $nama = trim((string) ($data['nama'] ?? ''));
-        $password = (string) ($data['password'] ?? '');
-        $role = trim((string) ($data['role'] ?? 'puskesmas'));
-        $idGudang = (int) ($data['id_gudang'] ?? 0);
-
-        if ($idAdmin <= 0) {
-            respond(422, ['error' => 'id_admin wajib']);
+        $id = (int)($data['id'] ?? $_GET['id'] ?? 0);
+        if ($id <= 0) {
+            respond(422, ['error' => 'ID user wajib diisi']);
         }
 
-        if ($nama === '') {
-            respond(422, ['error' => 'Nama wajib diisi']);
-        }
+        $existing = db_one(
+            "SELECT id_admin, nama, role, id_gudang
+             FROM user
+             WHERE id_admin = ?
+             LIMIT 1",
+            [$id]
+        );
 
-        if (!in_array($role, ['dinkes', 'puskesmas'], true)) {
-            respond(422, ['error' => 'Role tidak valid']);
-        }
-
-        if ($idGudang <= 0) {
-            respond(422, ['error' => 'Gudang wajib dipilih']);
-        }
-
-        $row = db_one("SELECT id_admin FROM `user` WHERE id_admin = ? LIMIT 1", [$idAdmin]);
-        if (!$row) {
+        if (!$existing) {
             respond(404, ['error' => 'User tidak ditemukan']);
         }
 
-        $duplicate = db_one(
-            "SELECT id_admin FROM `user` WHERE nama = ? AND id_admin <> ? LIMIT 1",
-            [$nama, $idAdmin]
-        );
-        if ($duplicate) {
-            respond(409, ['error' => 'Nama user sudah digunakan']);
+        $nama = array_key_exists('nama', $data)
+            ? clean_name((string)$data['nama'])
+            : (string)$existing['nama'];
+
+        $newRole = array_key_exists('role', $data)
+            ? clean_role((string)$data['role'])
+            : strtolower(trim((string)$existing['role']));
+
+        $idGudang = array_key_exists('id_gudang', $data)
+            ? clean_gudang_id($data['id_gudang'])
+            : (int)$existing['id_gudang'];
+
+        $password = array_key_exists('password', $data)
+            ? clean_password((string)$data['password'])
+            : '';
+
+        if ($nama === '' || $newRole === '' || $idGudang <= 0) {
+            respond(422, ['error' => 'Field tidak valid']);
         }
+
+        ensure_name_unique($nama, $id);
+        ensure_gudang_exists($idGudang);
 
         if ($password !== '') {
-            $hash = password_hash($password, PASSWORD_BCRYPT);
+            $hash = password_hash($password, PASSWORD_DEFAULT);
 
-            db_exec(
-                "
-                UPDATE `user`
-                SET nama = ?, password = ?, role = ?, id_gudang = ?
-                WHERE id_admin = ?
-                ",
-                [$nama, $hash, $role, $idGudang, $idAdmin]
+            $stmt = db()->prepare(
+                "UPDATE user
+                 SET nama = ?, password = ?, role = ?, id_gudang = ?
+                 WHERE id_admin = ?"
             );
+            $stmt->execute([$nama, $hash, $newRole, $idGudang, $id]);
         } else {
-            db_exec(
-                "
-                UPDATE `user`
-                SET nama = ?, role = ?, id_gudang = ?
-                WHERE id_admin = ?
-                ",
-                [$nama, $role, $idGudang, $idAdmin]
+            $stmt = db()->prepare(
+                "UPDATE user
+                 SET nama = ?, role = ?, id_gudang = ?
+                 WHERE id_admin = ?"
             );
+            $stmt->execute([$nama, $newRole, $idGudang, $id]);
         }
 
-        respond(200, ['ok' => true]);
+        $row = find_user_by_id($id);
+
+        respond(200, [
+            'message' => 'User berhasil diperbarui',
+            'user' => $row,
+        ]);
     }
 
     if ($method === 'DELETE') {
-        $idAdmin = (int) ($_GET['id_admin'] ?? 0);
+        $data = input_data();
+        $id = (int)($data['id'] ?? $_GET['id'] ?? 0);
 
-        if ($idAdmin <= 0) {
-            respond(422, ['error' => 'id_admin wajib']);
+        if ($id <= 0) {
+            respond(422, ['error' => 'ID user wajib diisi']);
         }
 
-        $row = db_one("SELECT id_admin FROM `user` WHERE id_admin = ? LIMIT 1", [$idAdmin]);
-        if (!$row) {
+        if ($id === (int)$me['id_admin']) {
+            respond(422, ['error' => 'User login saat ini tidak boleh dihapus']);
+        }
+
+        $existing = db_one(
+            "SELECT id_admin, nama
+             FROM user
+             WHERE id_admin = ?
+             LIMIT 1",
+            [$id]
+        );
+
+        if (!$existing) {
             respond(404, ['error' => 'User tidak ditemukan']);
         }
 
-        db_exec("DELETE FROM `user` WHERE id_admin = ?", [$idAdmin]);
+        $stmt = db()->prepare("DELETE FROM user WHERE id_admin = ?");
+        $stmt->execute([$id]);
 
-        respond(200, ['ok' => true]);
+        respond(200, [
+            'message' => 'User berhasil dihapus',
+            'id' => $id,
+        ]);
     }
 
-    respond(405, ['error' => 'Method tidak didukung']);
+    respond(405, ['error' => 'Method not allowed']);
 } catch (Throwable $e) {
-    respond(500, ['error' => $e->getMessage()]);
+    respond(500, [
+        'error' => 'Gagal memproses master user',
+        'detail' => $e->getMessage(),
+    ]);
 }
